@@ -139,6 +139,16 @@ func findZeroNonceReplay(ctx *cli.Context) error {
 		SnapshotLimit:  0,
 		Preimages:      true,
 		StateScheme:    scheme,
+		// Force archive-mode commits so every block's state lands on disk before
+		// InsertChain returns. This trades some replay speed and chaindata size
+		// for crash safety: with the default buffered mode, triedb.Commit only
+		// fires after gcproc accumulates beyond TrieTimeout (60 min), so a
+		// non-graceful exit (panic, SIGKILL, OOM) can leave the most recent
+		// hours of work as in-memory dirty nodes that vanish on crash. The
+		// repair on next startup then has to walk back to whatever Cap last
+		// evicted, which is expensive on leveldb. Forcing per-block commits
+		// makes restart-from-where-we-left-off truly cheap.
+		TrieDirtyDisabled: true,
 	}
 	chain, err := core.NewBlockChain(chainDb, cache, gspec, nil, engine, vm.Config{}, nil, nil)
 	if err != nil {
