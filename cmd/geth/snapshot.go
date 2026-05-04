@@ -166,7 +166,10 @@ the expected order for the overlay tree migration.
 				Name:      "find-zero-nonce-replay",
 				Usage:     "Replay chain history to find pre-Spurious-Dragon zero-nonce accounts with non-empty storage",
 				ArgsUsage: "<era-dir>",
-				Flags:     flags.Merge(utils.NetworkFlags, utils.DatabaseFlags),
+				Flags: flags.Merge(
+					[]cli.Flag{zeroNonceMatchesFlag, zeroNonceProgressFlag},
+					utils.NetworkFlags, utils.DatabaseFlags,
+				),
 				Description: `
 geth snapshot find-zero-nonce-replay <era-dir>
 

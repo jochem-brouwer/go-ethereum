@@ -144,7 +144,7 @@ func TestZeroNonceFinder(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	matches, err := inspectCreations(statedb, chain.TrieDB(), header.Root, collector, &buf)
+	matches, err := inspectCreations(statedb, chain.TrieDB(), header.Root, collector.drain(), make(map[common.Address]struct{}), &buf)
 	if err != nil {
 		t.Fatalf("inspectCreations: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestZeroNonceFinderIgnoresAccountsWithCode(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	matches, err := inspectCreations(statedb, chain.TrieDB(), header.Root, collector, &buf)
+	matches, err := inspectCreations(statedb, chain.TrieDB(), header.Root, collector.drain(), make(map[common.Address]struct{}), &buf)
 	if err != nil {
 		t.Fatalf("inspectCreations: %v", err)
 	}
