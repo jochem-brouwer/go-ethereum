@@ -24,13 +24,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
 	"os"
 	"path"
-	"sort"
-	"strconv"
-	"strings"
-	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/cmd/utils"
@@ -38,17 +33,14 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
-	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
-	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
+	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/internal/era"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
-	"github.com/ethereum/go-ethereum/trie"
-	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/urfave/cli/v2"
 )
 
@@ -56,88 +48,32 @@ import (
 // no code, but non-empty storage if the init code wrote storage and returned
 // empty deployment bytecode. EIP-161 changed CREATE to bump the new contract's
 // nonce to 1 and made empty-account touching delete the account, so no such
-// account can be created post-fork. CREATE2 was introduced in Constantinople,
-// long after Spurious Dragon, so it is irrelevant here but checked anyway.
-
-// createCollector implements vm.EVMLogger and accumulates the addresses of
-// contracts created during chain replay. v1.13's tracer interface fires
-// CaptureStart for the top-level frame (with create=true for tx-creates)
-// and CaptureEnter for sub-calls (with typ=CREATE/CREATE2 for opcode-level
-// creates), so the two hooks together capture every contract creation.
+// account can be created post-fork. Once the chain has crossed Spurious Dragon,
+// these contracts are stable in the state — they have no code, and SELFDESTRUCT
+// can only be invoked by code running in the contract's own context, so they
+// can never delete themselves. (Pre-EIP-6780 SELFDESTRUCT *would* have wiped
+// them, but reaching it requires code, and matching contracts have none.)
 //
-// The state prefetcher (core/state_prefetcher.go) runs the EVM speculatively
-// in a goroutine, sharing the same vm.Config (and therefore the same tracer)
-// as the main thread. The mutex serializes writes to the map so the two
-// callers don't race. The prefetcher may record speculative addresses that
-// don't exist in the canonical post-state; inspectCreations filters those
-// out via Exist() / nonce / code / storage checks.
-type createCollector struct {
-	mu        sync.Mutex
-	creations map[common.Address]struct{}
-}
-
-func newCreateCollector() *createCollector {
-	return &createCollector{creations: make(map[common.Address]struct{})}
-}
-
-func (c *createCollector) record(addr common.Address) {
-	c.mu.Lock()
-	c.creations[addr] = struct{}{}
-	c.mu.Unlock()
-}
-
-// drain returns the addresses observed since the last drain and resets the
-// internal set. The caller is the only owner of the returned slice.
-func (c *createCollector) drain() []common.Address {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if len(c.creations) == 0 {
-		return nil
-	}
-	out := make([]common.Address, 0, len(c.creations))
-	for a := range c.creations {
-		out = append(out, a)
-	}
-	c.creations = make(map[common.Address]struct{})
-	return out
-}
-
-func (c *createCollector) CaptureTxStart(uint64) {}
-func (c *createCollector) CaptureTxEnd(uint64)   {}
-
-func (c *createCollector) CaptureStart(env *vm.EVM, from, to common.Address, create bool, input []byte, gas uint64, value *big.Int) {
-	if create {
-		c.record(to)
-	}
-}
-func (c *createCollector) CaptureEnd([]byte, uint64, error) {}
-
-func (c *createCollector) CaptureEnter(typ vm.OpCode, from, to common.Address, input []byte, gas uint64, value *big.Int) {
-	if typ == vm.CREATE || typ == vm.CREATE2 {
-		c.record(to)
-	}
-}
-func (c *createCollector) CaptureExit([]byte, uint64, error) {}
-
-func (c *createCollector) CaptureState(uint64, vm.OpCode, uint64, uint64, *vm.ScopeContext, []byte, int, error) {
-}
-func (c *createCollector) CaptureFault(uint64, vm.OpCode, uint64, uint64, *vm.ScopeContext, int, error) {
-}
+// We exploit this stability: rather than tracing every CREATE during replay,
+// we just replay the chain through the EIP-158 boundary, build a snapshot at
+// that block, and walk the snapshot directly. The snapshot's flat layout
+// makes a full pass cheap, and CacheConfig.Preimages=true ensures the trie
+// commit populates account- and storage-key preimages in the trie database
+// for reverse lookup at emission time.
 
 // zeroNonceSlot describes one storage slot of a matching account. KeyHash is
 // always set (it is the on-disk trie key); Key is the preimage and is only
-// populated when known: always for the replay scanner (preimage caching is
-// enabled and the trie commit records every slot key) and opportunistically
-// for the snapshot scanner (when geth has the preimage on disk).
+// populated when the trie database has it (which it does for everything written
+// during a replay run, since we run with Preimages=true).
 type zeroNonceSlot struct {
 	Key     *common.Hash `json:"key,omitempty"`
 	KeyHash common.Hash  `json:"keyHash"`
 }
 
 // zeroNonceMatch is one record in the JSON Lines output stream. Address is
-// only populated when the preimage is known: always for the replay scanner
-// (we observe the address before it is hashed), and opportunistically for
-// the snapshot scanner (when geth has the preimage on disk).
+// only populated when the preimage is on disk: always for the replay scanner
+// (preimages are recorded for every address modified during replay), and
+// opportunistically for the standalone snapshot scanner.
 type zeroNonceMatch struct {
 	Address     *common.Address `json:"address,omitempty"`
 	AddressHash common.Hash     `json:"addressHash"`
@@ -147,111 +83,26 @@ type zeroNonceMatch struct {
 	Storage     []zeroNonceSlot `json:"storage,omitempty"`
 }
 
-// inspectCreations checks each address in addrs against the post-state at
-// stateRoot and emits matches as JSON Lines on out. Addresses already present
-// in emitted are skipped (and emitted is updated for new matches), so calling
-// this repeatedly with overlapping address sets is safe — useful both for
-// per-block emission during replay and for restart-time dedupe against an
-// existing matches file. For each match the storage trie is iterated to
-// enumerate slot keys, with preimages resolved via the trie database
-// (populated by the secure-trie commit when CacheConfig.Preimages is enabled).
-// Accounts that were SELFDESTRUCT-ed are silently skipped — pre-EIP-6780
-// SELFDESTRUCT clears storage, so they neither exist nor have storage.
-func inspectCreations(statedb *state.StateDB, tdb *triedb.Database, stateRoot common.Hash, addrs []common.Address, emitted map[common.Address]struct{}, out io.Writer) (int, error) {
-	enc := json.NewEncoder(out)
-	matches := 0
-	for _, addr := range addrs {
-		if _, ok := emitted[addr]; ok {
-			continue
-		}
-		if !statedb.Exist(addr) {
-			continue
-		}
-		if statedb.GetNonce(addr) != 0 {
-			continue
-		}
-		codeHash := statedb.GetCodeHash(addr)
-		if codeHash != types.EmptyCodeHash {
-			continue
-		}
-		storageRoot := statedb.GetStorageRoot(addr)
-		if storageRoot == (common.Hash{}) || storageRoot == types.EmptyRootHash {
-			continue
-		}
-		addrCopy := addr
-		addrHash := crypto.Keccak256Hash(addr.Bytes())
-		match := zeroNonceMatch{
-			Address:     &addrCopy,
-			AddressHash: addrHash,
-			Balance:     (*hexutil.Big)(statedb.GetBalance(addr).ToBig()),
-			CodeHash:    codeHash,
-			StorageRoot: storageRoot,
-		}
-		st, err := trie.NewStateTrie(trie.StorageTrieID(stateRoot, addrHash, storageRoot), tdb)
-		if err != nil {
-			return matches, fmt.Errorf("open storage trie for %s: %w", addr.Hex(), err)
-		}
-		nodeIt, err := st.NodeIterator(nil)
-		if err != nil {
-			return matches, fmt.Errorf("storage iterator for %s: %w", addr.Hex(), err)
-		}
-		var slots []zeroNonceSlot
-		leafIt := trie.NewIterator(nodeIt)
-		for leafIt.Next() {
-			slotHash := common.BytesToHash(leafIt.Key)
-			slot := zeroNonceSlot{KeyHash: slotHash}
-			if pre := tdb.Preimage(slotHash); len(pre) == common.HashLength {
-				key := common.BytesToHash(pre)
-				slot.Key = &key
-			}
-			slots = append(slots, slot)
-		}
-		if leafIt.Err != nil {
-			return matches, fmt.Errorf("walk storage trie for %s: %w", addr.Hex(), leafIt.Err)
-		}
-		sort.Slice(slots, func(i, j int) bool {
-			return bytes.Compare(slots[i].KeyHash[:], slots[j].KeyHash[:]) < 0
-		})
-		match.Storage = slots
-		if err := enc.Encode(match); err != nil {
-			return matches, err
-		}
-		emitted[addr] = struct{}{}
-		matches++
-	}
-	return matches, nil
+// zeroNonceMatchesFlag controls where matches are persisted. The file is
+// opened in append mode and a dedupe set is built from its existing contents
+// at startup, so both find-zero-nonce-replay and find-zero-nonce can be
+// invoked repeatedly against the same datadir without producing duplicates.
+var zeroNonceMatchesFlag = &cli.StringFlag{
+	Name:  "zero-nonce.matches",
+	Value: "zero-nonce-matches.jsonl",
+	Usage: "Path to JSON-Lines file matches are appended to (idempotent across re-runs)",
 }
 
-// Flags controlling where the replay scanner persists matches and progress
-// so it can resume after a crash. The matches file is opened in append mode;
-// addresses already present are skipped on subsequent runs to avoid duplicate
-// emissions. The progress file holds the highest block number whose matches
-// have been fully written and fsync'd.
-var (
-	zeroNonceMatchesFlag = &cli.StringFlag{
-		Name:  "zero-nonce.matches",
-		Value: "zero-nonce-matches.jsonl",
-		Usage: "Path to the JSON-Lines file matches are appended to (resumable across crashes)",
-	}
-	zeroNonceProgressFlag = &cli.StringFlag{
-		Name:  "zero-nonce.progress",
-		Value: "zero-nonce-progress.txt",
-		Usage: "Path to the file holding the last fully-inspected block number",
-	}
-)
-
 // findZeroNonceReplay replays an Era1 archive of the chain through the
-// EIP-158 (Spurious Dragon) activation block. Every contract creation is
-// observed by address; after each block is committed the post-state of any
-// addresses created since the previous block is inspected and any matches
-// of the zero-nonce, empty-code, non-empty-storage condition are appended
-// to the matches file. The block number is then written to the progress
-// file. Both files are written incrementally so the run can be killed and
-// resumed without losing previously-written matches.
+// EIP-158 (Spurious Dragon) activation block, builds a snapshot at the
+// boundary root, then walks the snapshot's flat key layout to find every
+// account matching the zero-nonce / empty-code / non-empty-storage condition.
 //
-// CacheConfig.Preimages is forced on so the secure-trie commit records each
-// storage slot key as a preimage; we look these up at emission time to emit
-// the raw slot keys in addition to their on-disk hashes.
+// Replay starts from chain.CurrentBlock()+1, so a previously crashed run
+// can be resumed by re-invoking the same command — block bodies, receipts,
+// and state are all persisted by InsertChain. The snapshot is built only
+// once at the end (CacheConfig.SnapshotLimit=0 during replay) so replay
+// itself stays fast.
 func findZeroNonceReplay(ctx *cli.Context) error {
 	if ctx.Args().Len() != 1 {
 		utils.Fatalf("usage: geth snapshot find-zero-nonce-replay <era-dir>")
@@ -281,7 +132,6 @@ func findZeroNonceReplay(ctx *cli.Context) error {
 		return err
 	}
 
-	collector := newCreateCollector()
 	cache := &core.CacheConfig{
 		TrieCleanLimit: ethconfig.Defaults.TrieCleanCache,
 		TrieDirtyLimit: ethconfig.Defaults.TrieDirtyCache,
@@ -290,17 +140,81 @@ func findZeroNonceReplay(ctx *cli.Context) error {
 		Preimages:      true,
 		StateScheme:    scheme,
 	}
-	vmcfg := vm.Config{Tracer: collector}
-
-	chain, err := core.NewBlockChain(chainDb, cache, gspec, nil, engine, vmcfg, nil, nil)
+	chain, err := core.NewBlockChain(chainDb, cache, gspec, nil, engine, vm.Config{}, nil, nil)
 	if err != nil {
 		return fmt.Errorf("create blockchain: %w", err)
 	}
 	defer chain.Stop()
 
-	matchesPath := ctx.String(zeroNonceMatchesFlag.Name)
-	progressPath := ctx.String(zeroNonceProgressFlag.Name)
+	dir := ctx.Args().Get(0)
+	network, err := detectEraNetwork(ctx, dir)
+	if err != nil {
+		return err
+	}
 
+	headNum := chain.CurrentBlock().Number.Uint64()
+	log.Info("Zero-nonce replay starting",
+		"era", dir, "network", network, "target", target, "chainHead", headNum)
+
+	if headNum < target {
+		if err := replayEraToBlock(chain, dir, network, target, headNum); err != nil {
+			return err
+		}
+	} else {
+		log.Info("Chain already past target, skipping replay", "head", headNum)
+	}
+
+	boundaryHeader := chain.GetHeaderByNumber(target)
+	if boundaryHeader == nil {
+		return fmt.Errorf("boundary block %d missing after replay", target)
+	}
+	boundaryRoot := boundaryHeader.Root
+
+	log.Info("Building snapshot at boundary block (synchronous)",
+		"block", target, "root", boundaryRoot)
+	snapConfig := snapshot.Config{
+		CacheSize:  256,
+		Recovery:   false,
+		NoBuild:    false,
+		AsyncBuild: false,
+	}
+	if _, err := snapshot.New(snapConfig, chainDb, chain.TrieDB(), boundaryRoot); err != nil {
+		return fmt.Errorf("build snapshot: %w", err)
+	}
+	log.Info("Snapshot ready, scanning for matches", "root", boundaryRoot)
+
+	matchesPath := ctx.String(zeroNonceMatchesFlag.Name)
+	return runSnapshotScan(chainDb, matchesPath)
+}
+
+// findZeroNonce walks the existing snapshot of an open datadir and emits
+// every account matching the zero-nonce / empty-code / non-empty-storage
+// condition. The optional <root> argument is accepted for compatibility but
+// ignored — the disk-layer snapshot is keyed by keccak256(address) regardless
+// of which state root it represents, and a node only ever has one disk-layer
+// snapshot at a time.
+func findZeroNonce(ctx *cli.Context) error {
+	if ctx.NArg() > 1 {
+		return errors.New("too many arguments")
+	}
+	stack, _ := makeConfigNode(ctx)
+	defer stack.Close()
+
+	db := utils.MakeChainDatabase(ctx, stack, true)
+	defer db.Close()
+
+	if root := rawdb.ReadSnapshotRoot(db); root == (common.Hash{}) {
+		return errors.New("no snapshot present in this datadir; run snap sync or find-zero-nonce-replay first")
+	} else {
+		log.Info("Scanning existing snapshot", "root", root)
+	}
+	matchesPath := ctx.String(zeroNonceMatchesFlag.Name)
+	return runSnapshotScan(db, matchesPath)
+}
+
+// runSnapshotScan opens the matches file, prepares the dedupe set from its
+// existing contents, and invokes scanSnapshot. Shared by both subcommands.
+func runSnapshotScan(db ethdb.Database, matchesPath string) error {
 	emitted, err := readEmittedMatches(matchesPath)
 	if err != nil {
 		return fmt.Errorf("read existing matches %s: %w", matchesPath, err)
@@ -311,30 +225,121 @@ func findZeroNonceReplay(ctx *cli.Context) error {
 	}
 	defer matchesFile.Close()
 
-	progress, _ := readProgress(progressPath) // 0 if missing
-	headNum := chain.CurrentBlock().Number.Uint64()
-	resumeFrom := headNum
-	if progress > resumeFrom {
-		// Should not happen (progress is written after InsertChain), but defend
-		// against it: trust the chain head, which is what we'll re-execute past.
-		resumeFrom = headNum
-	}
-
-	dir := ctx.Args().Get(0)
-	network, err := detectEraNetwork(ctx, dir)
+	log.Info("Snapshot scan starting", "matchesFile", matchesPath, "alreadyEmitted", len(emitted))
+	matches, err := scanSnapshot(db, matchesFile, emitted)
 	if err != nil {
 		return err
 	}
-	log.Info("Zero-nonce replay starting",
-		"era", dir, "network", network, "target", target,
-		"chainHead", headNum, "progressCheckpoint", progress,
-		"matchesAlreadyEmitted", len(emitted), "matchesFile", matchesPath)
+	log.Info("Snapshot scan complete", "newMatches", matches, "totalEmitted", len(emitted))
+	return nil
+}
 
-	if resumeFrom >= target {
-		log.Info("Chain already at or past target; nothing to replay", "head", resumeFrom)
-		return nil
+// scanSnapshot iterates the disk-layer snapshot (SnapshotAccountPrefix range)
+// and emits accounts matching the zero-nonce / empty-code / non-empty-storage
+// condition. For each match the storage trie's flat snapshot is walked to
+// enumerate slot keys (SnapshotStoragePrefix range, scoped to the account),
+// and address + slot preimages are looked up in the trie database's preimage
+// table. Already-emitted addresses (per the `emitted` set) are skipped.
+//
+// The direct prefix iteration deliberately bypasses snapshot.Tree's diff-layer
+// machinery because at this point only the disk-layer state matters and key
+// length filtering is enough to avoid stray entries.
+func scanSnapshot(db ethdb.Database, out io.Writer, emitted map[common.Address]struct{}) (int, error) {
+	// Wrap the writer once so json.Encoder buffers between encodings; we
+	// flush after each emitted match so a crash mid-scan still leaves the
+	// matches file in a recoverable state.
+	buf := bufio.NewWriter(out)
+	enc := json.NewEncoder(buf)
+
+	accountPrefix := rawdb.SnapshotAccountPrefix
+	accountKeyLen := len(accountPrefix) + common.HashLength
+
+	iter := db.NewIterator(accountPrefix, nil)
+	defer iter.Release()
+
+	var (
+		scanned uint64
+		matches int
+		start   = time.Now()
+		logged  = time.Now()
+	)
+	for iter.Next() {
+		if k := iter.Key(); len(k) != accountKeyLen {
+			continue
+		}
+		scanned++
+
+		accountHash := common.BytesToHash(iter.Key()[len(accountPrefix):])
+
+		full, err := types.FullAccount(iter.Value())
+		if err != nil {
+			return matches, fmt.Errorf("decode snapshot account %s: %w", accountHash.Hex(), err)
+		}
+		if full.Nonce != 0 {
+			continue
+		}
+		if !bytes.Equal(full.CodeHash, types.EmptyCodeHash.Bytes()) {
+			continue
+		}
+		if full.Root == (common.Hash{}) || full.Root == types.EmptyRootHash {
+			continue
+		}
+
+		match := zeroNonceMatch{
+			AddressHash: accountHash,
+			Balance:     (*hexutil.Big)(full.Balance.ToBig()),
+			CodeHash:    common.BytesToHash(full.CodeHash),
+			StorageRoot: full.Root,
+		}
+		if pre := rawdb.ReadPreimage(db, accountHash); len(pre) == common.AddressLength {
+			addr := common.BytesToAddress(pre)
+			if _, dup := emitted[addr]; dup {
+				continue
+			}
+			match.Address = &addr
+		}
+
+		// Walk the account's storage snapshot range to enumerate slot keys.
+		stIter := rawdb.IterateStorageSnapshots(db, accountHash)
+		for stIter.Next() {
+			key := stIter.Key()
+			// Key layout: SnapshotStoragePrefix(1) || accountHash(32) || slotHash(32)
+			slotHash := common.BytesToHash(key[len(rawdb.SnapshotStoragePrefix)+common.HashLength:])
+			slot := zeroNonceSlot{KeyHash: slotHash}
+			if pre := rawdb.ReadPreimage(db, slotHash); len(pre) == common.HashLength {
+				k := common.BytesToHash(pre)
+				slot.Key = &k
+			}
+			match.Storage = append(match.Storage, slot)
+		}
+		stIter.Release()
+
+		if err := enc.Encode(match); err != nil {
+			return matches, err
+		}
+		if err := buf.Flush(); err != nil {
+			return matches, fmt.Errorf("flush matches: %w", err)
+		}
+		matches++
+		if match.Address != nil {
+			emitted[*match.Address] = struct{}{}
+		}
+
+		if time.Since(logged) > 8*time.Second {
+			log.Info("Scanning snapshot",
+				"scanned", scanned, "matches", matches, "elapsed", common.PrettyDuration(time.Since(start)))
+			logged = time.Now()
+		}
 	}
-	return replayEraToBlock(chain, dir, network, target, resumeFrom, collector, matchesFile, progressPath, emitted)
+	if err := iter.Error(); err != nil {
+		return matches, err
+	}
+	if err := buf.Flush(); err != nil {
+		return matches, fmt.Errorf("flush matches: %w", err)
+	}
+	log.Info("Snapshot scan finished",
+		"scanned", scanned, "newMatches", matches, "elapsed", common.PrettyDuration(time.Since(start)))
+	return matches, nil
 }
 
 // readEmittedMatches scans an existing matches file (JSON-Lines) and returns
@@ -374,29 +379,6 @@ func readEmittedMatches(p string) (map[common.Address]struct{}, error) {
 	return out, s.Err()
 }
 
-// readProgress returns the last fully-inspected block number written to the
-// progress file. Missing file → 0.
-func readProgress(p string) (uint64, error) {
-	data, err := os.ReadFile(p)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return 0, nil
-		}
-		return 0, err
-	}
-	return strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
-}
-
-// writeProgress atomically updates the progress file. We write to a temp
-// file and rename so a crash mid-write can never leave a half-written file.
-func writeProgress(p string, block uint64) error {
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, []byte(strconv.FormatUint(block, 10)+"\n"), 0644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, p)
-}
-
 // detectEraNetwork mirrors importHistory's network resolution: prefer an
 // explicit network flag, otherwise auto-detect by scanning the directory.
 func detectEraNetwork(ctx *cli.Context, dir string) (string, error) {
@@ -432,15 +414,11 @@ func detectEraNetwork(ctx *cli.Context, dir string) (string, error) {
 
 // replayEraToBlock streams blocks out of the era archives in `dir` and feeds
 // them through chain.InsertChain (executing them, unlike utils.ImportHistory
-// which uses InsertReceiptChain). Replay starts from `resumeFrom + 1` (use 0
-// to start from genesis) and halts after the block at `target` is committed.
-//
-// Each block is inserted on its own (rather than in batches) so that we can
-// inspect the post-state and persist progress per block: if the process is
-// killed, the chain database has only fully-committed blocks and the matches
-// + progress files reflect everything inspected up to that point. Resume
-// then picks up from chain.CurrentBlock().
-func replayEraToBlock(chain *core.BlockChain, dir, network string, target, resumeFrom uint64, collector *createCollector, matchesOut io.Writer, progressPath string, emitted map[common.Address]struct{}) error {
+// which uses InsertReceiptChain). Replay starts from `resumeFrom + 1` and
+// halts after the block at `target` is committed. Blocks are inserted in
+// batches for performance; matches are emitted later from the snapshot scan,
+// so there is no longer any need to break batches on block boundaries.
+func replayEraToBlock(chain *core.BlockChain, dir, network string, target, resumeFrom uint64) error {
 	entries, err := era.ReadDir(dir, network)
 	if err != nil {
 		return fmt.Errorf("read era dir: %w", err)
@@ -453,16 +431,14 @@ func replayEraToBlock(chain *core.BlockChain, dir, network string, target, resum
 		return fmt.Errorf("checksums (%d) and entries (%d) count mismatch", len(checksums), len(entries))
 	}
 
+	const batchSize = 2500
 	var (
-		start         = time.Now()
-		reported      = time.Now()
-		imported      = uint64(0)
-		matchesTotal  = uint64(0)
-		hasher        = sha256.New()
-		hbuf          = bytes.NewBuffer(nil)
-		matchesWriter = bufio.NewWriter(matchesOut)
+		start    = time.Now()
+		reported = time.Now()
+		imported = uint64(0)
+		hasher   = sha256.New()
+		hbuf     = bytes.NewBuffer(nil)
 	)
-	flushMatches := func() error { return matchesWriter.Flush() }
 
 	for i, filename := range entries {
 		stop, err := func() (bool, error) {
@@ -491,6 +467,27 @@ func replayEraToBlock(chain *core.BlockChain, dir, network string, target, resum
 				return false, fmt.Errorf("create era iterator: %w", err)
 			}
 
+			batch := make([]*types.Block, 0, batchSize)
+			flush := func() error {
+				if len(batch) == 0 {
+					return nil
+				}
+				if _, err := chain.InsertChain(batch); err != nil {
+					return fmt.Errorf("insert blocks %d..%d: %w",
+						batch[0].NumberU64(), batch[len(batch)-1].NumberU64(), err)
+				}
+				imported += uint64(len(batch))
+				if time.Since(reported) >= 8*time.Second {
+					log.Info("Replaying era files",
+						"head", batch[len(batch)-1].NumberU64(),
+						"imported", imported,
+						"elapsed", common.PrettyDuration(time.Since(start)))
+					reported = time.Now()
+				}
+				batch = batch[:0]
+				return nil
+			}
+
 			for it.Next() {
 				block, err := it.Block()
 				if err != nil {
@@ -501,44 +498,19 @@ func replayEraToBlock(chain *core.BlockChain, dir, network string, target, resum
 					continue
 				}
 				if num > target {
-					return true, nil
-				}
-				if _, err := chain.InsertChain([]*types.Block{block}); err != nil {
-					return false, fmt.Errorf("insert block %d: %w", num, err)
-				}
-				imported++
-
-				addrs := collector.drain()
-				if len(addrs) > 0 {
-					statedb, err := chain.StateAt(block.Root())
-					if err != nil {
-						return false, fmt.Errorf("state at block %d (root %x): %w", num, block.Root(), err)
-					}
-					n, err := inspectCreations(statedb, chain.TrieDB(), block.Root(), addrs, emitted, matchesWriter)
-					if err != nil {
+					if err := flush(); err != nil {
 						return false, err
 					}
-					if n > 0 {
-						if err := flushMatches(); err != nil {
-							return false, fmt.Errorf("flush matches: %w", err)
-						}
-						matchesTotal += uint64(n)
-						log.Info("Found new zero-nonce-with-storage accounts",
-							"block", num, "new", n, "total", matchesTotal)
+					return true, nil
+				}
+				batch = append(batch, block)
+				if len(batch) >= batchSize {
+					if err := flush(); err != nil {
+						return false, err
 					}
 				}
-				if err := writeProgress(progressPath, num); err != nil {
-					return false, fmt.Errorf("write progress: %w", err)
-				}
-
-				if time.Since(reported) >= 8*time.Second {
-					log.Info("Replaying era files",
-						"head", num, "imported", imported, "matches", matchesTotal,
-						"elapsed", common.PrettyDuration(time.Since(start)))
-					reported = time.Now()
-				}
 			}
-			return false, nil
+			return false, flush()
 		}()
 		if err != nil {
 			return err
@@ -548,15 +520,10 @@ func replayEraToBlock(chain *core.BlockChain, dir, network string, target, resum
 		}
 	}
 
-	if err := flushMatches(); err != nil {
-		return fmt.Errorf("flush matches: %w", err)
-	}
 	head := chain.CurrentBlock().Number.Uint64()
 	if head < target {
 		return fmt.Errorf("era archives exhausted before reaching target block %d (head: %d)", target, head)
 	}
-	log.Info("Zero-nonce replay scan complete",
-		"head", head, "matchesThisRun", matchesTotal, "matchesEmittedTotal", len(emitted))
 	return nil
 }
 
@@ -576,117 +543,4 @@ func readEraChecksums(p string) ([]string, error) {
 		}
 	}
 	return lines, s.Err()
-}
-
-// findZeroNonce iterates the on-disk snapshot at the given root (defaulting
-// to the chain head) and emits every account whose stored value matches the
-// zero-nonce, empty-code, non-empty-storage condition. Account preimages are
-// emitted when present in the geth preimage table; storage slot preimages
-// are similarly emitted when available.
-func findZeroNonce(ctx *cli.Context) error {
-	stack, _ := makeConfigNode(ctx)
-	defer stack.Close()
-
-	db := utils.MakeChainDatabase(ctx, stack, true)
-	defer db.Close()
-
-	tdb := utils.MakeTrieDatabase(ctx, db, false, true, false)
-	defer tdb.Close()
-
-	if ctx.NArg() > 1 {
-		return errors.New("too many arguments")
-	}
-	var (
-		root common.Hash
-		err  error
-	)
-	if ctx.NArg() == 1 {
-		root, err = parseRoot(ctx.Args().First())
-		if err != nil {
-			return err
-		}
-	} else {
-		head := rawdb.ReadHeadBlock(db)
-		if head == nil {
-			return errors.New("no head block in database")
-		}
-		root = head.Root()
-	}
-
-	snapConfig := snapshot.Config{
-		CacheSize:  256,
-		Recovery:   false,
-		NoBuild:    true,
-		AsyncBuild: false,
-	}
-	snaptree, err := snapshot.New(snapConfig, db, tdb, root)
-	if err != nil {
-		return err
-	}
-	accIt, err := snaptree.AccountIterator(root, common.Hash{})
-	if err != nil {
-		return err
-	}
-	defer accIt.Release()
-
-	enc := json.NewEncoder(os.Stdout)
-	var (
-		scanned uint64
-		matches uint64
-		start   = time.Now()
-		logged  = time.Now()
-	)
-	log.Info("Zero-nonce snapshot scan started", "root", root)
-	for accIt.Next() {
-		scanned++
-		account, err := types.FullAccount(accIt.Account())
-		if err != nil {
-			return err
-		}
-		if account.Nonce != 0 {
-			continue
-		}
-		if !bytes.Equal(account.CodeHash, types.EmptyCodeHash.Bytes()) {
-			continue
-		}
-		if account.Root == (common.Hash{}) || account.Root == types.EmptyRootHash {
-			continue
-		}
-		match := zeroNonceMatch{
-			AddressHash: accIt.Hash(),
-			Balance:     (*hexutil.Big)(account.Balance.ToBig()),
-			CodeHash:    common.BytesToHash(account.CodeHash),
-			StorageRoot: account.Root,
-		}
-		if pre := rawdb.ReadPreimage(db, accIt.Hash()); len(pre) == common.AddressLength {
-			addr := common.BytesToAddress(pre)
-			match.Address = &addr
-		}
-		stIt, err := snaptree.StorageIterator(root, accIt.Hash(), common.Hash{})
-		if err != nil {
-			return fmt.Errorf("open storage iterator for %s: %w", accIt.Hash().Hex(), err)
-		}
-		for stIt.Next() {
-			slotHash := stIt.Hash()
-			slot := zeroNonceSlot{KeyHash: slotHash}
-			if pre := rawdb.ReadPreimage(db, slotHash); len(pre) == common.HashLength {
-				key := common.BytesToHash(pre)
-				slot.Key = &key
-			}
-			match.Storage = append(match.Storage, slot)
-		}
-		stIt.Release()
-		if err := enc.Encode(match); err != nil {
-			return err
-		}
-		matches++
-		if time.Since(logged) > 8*time.Second {
-			log.Info("Zero-nonce snapshot scan in progress",
-				"scanned", scanned, "matches", matches, "elapsed", common.PrettyDuration(time.Since(start)))
-			logged = time.Now()
-		}
-	}
-	log.Info("Zero-nonce snapshot scan complete",
-		"scanned", scanned, "matches", matches, "elapsed", common.PrettyDuration(time.Since(start)))
-	return nil
 }

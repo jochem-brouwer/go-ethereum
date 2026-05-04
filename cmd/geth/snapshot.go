@@ -167,7 +167,7 @@ the expected order for the overlay tree migration.
 				Usage:     "Replay chain history to find pre-Spurious-Dragon zero-nonce accounts with non-empty storage",
 				ArgsUsage: "<era-dir>",
 				Flags: flags.Merge(
-					[]cli.Flag{zeroNonceMatchesFlag, zeroNonceProgressFlag},
+					[]cli.Flag{zeroNonceMatchesFlag},
 					utils.NetworkFlags, utils.DatabaseFlags,
 				),
 				Description: `
@@ -194,7 +194,10 @@ files (e.g. fetched with the download-era command from a newer Geth release).
 				Name:      "find-zero-nonce",
 				Usage:     "Iterate snapshot to find zero-nonce accounts with non-empty storage",
 				ArgsUsage: "[<root>]",
-				Flags:     flags.Merge(utils.NetworkFlags, utils.DatabaseFlags),
+				Flags: flags.Merge(
+					[]cli.Flag{zeroNonceMatchesFlag},
+					utils.NetworkFlags, utils.DatabaseFlags,
+				),
 				Description: `
 geth snapshot find-zero-nonce [<state-root>]
 

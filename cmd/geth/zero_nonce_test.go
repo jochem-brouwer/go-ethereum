@@ -19,221 +19,125 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"math"
-	"math/big"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/consensus/ethash"
-	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/holiman/uint256"
 )
 
-// testChainConfig builds a Frontier-through-pre-Spurious-Dragon chain config
-// whose EIP-158 boundary is at the given block number. All later forks are
-// pinned to the same boundary so the chain config is internally consistent.
-func testChainConfig(boundary *big.Int) *params.ChainConfig {
-	return &params.ChainConfig{
-		ChainID:                 big.NewInt(1),
-		HomesteadBlock:          big.NewInt(0),
-		EIP150Block:             big.NewInt(0),
-		EIP155Block:             big.NewInt(0),
-		EIP158Block:             boundary,
-		ByzantiumBlock:          boundary,
-		ConstantinopleBlock:     boundary,
-		PetersburgBlock:         boundary,
-		IstanbulBlock:           boundary,
-		MuirGlacierBlock:        boundary,
-		BerlinBlock:             boundary,
-		LondonBlock:             boundary,
-		ArrowGlacierBlock:       boundary,
-		GrayGlacierBlock:        boundary,
-		TerminalTotalDifficulty: big.NewInt(math.MaxInt64),
-		Ethash:                  new(params.EthashConfig),
-	}
-}
-
-func makeTestChain(t *testing.T, gspec *core.Genesis, blocks []*types.Block) (*core.BlockChain, *createCollector) {
+// writeSnapshotAccount writes a synthetic snapshot account entry for tests.
+// Setting storageRoot != EmptyRootHash makes the account appear to have
+// non-empty storage; codeHash != EmptyCodeHash makes it appear to have code.
+func writeSnapshotAccount(t *testing.T, db ethdb.KeyValueWriter, addr common.Address, nonce uint64, balance uint64, codeHash, storageRoot common.Hash) common.Hash {
 	t.Helper()
-	collector := newCreateCollector()
-	cache := &core.CacheConfig{
-		TrieCleanLimit: 256,
-		TrieDirtyLimit: 256,
-		Preimages:      true,
-		StateScheme:    rawdb.HashScheme,
+	full := types.StateAccount{
+		Nonce:    nonce,
+		Balance:  uint256.NewInt(balance),
+		Root:     storageRoot,
+		CodeHash: codeHash[:],
 	}
-	vmcfg := vm.Config{Tracer: collector}
-	chain, err := core.NewBlockChain(rawdb.NewMemoryDatabase(), cache, gspec, nil, ethash.NewFaker(), vmcfg, nil, nil)
-	if err != nil {
-		t.Fatalf("new chain: %v", err)
-	}
-	if _, err := chain.InsertChain(blocks); err != nil {
-		chain.Stop()
-		t.Fatalf("insert chain: %v", err)
-	}
-	return chain, collector
+	addrHash := crypto.Keccak256Hash(addr.Bytes())
+	rawdb.WriteAccountSnapshot(db, addrHash, types.SlimAccountRLP(full))
+	return addrHash
 }
 
-// TestZeroNonceFinder builds a synthetic chain whose Spurious Dragon (EIP-158)
-// activation is at block 5, deploys a contract in block 1 whose init code
-// writes a storage slot and returns empty deployment bytecode, then checks
-// that the resulting nonce-0/empty-code/non-empty-storage account is reported
-// at the boundary. The reported storage slot must include both the slot key
-// preimage (recovered via the trie database's preimage table) and its hash.
-func TestZeroNonceFinder(t *testing.T) {
-	var (
-		key, _   = crypto.GenerateKey()
-		addr     = crypto.PubkeyToAddress(key.PublicKey)
-		boundary = big.NewInt(5)
-		config   = testChainConfig(boundary)
-		gspec    = &core.Genesis{
-			Config: config,
-			Alloc:  types.GenesisAlloc{addr: {Balance: big.NewInt(1_000_000_000_000_000_000)}},
-		}
-		signer = types.LatestSigner(config)
+// TestScanSnapshot constructs a synthetic snapshot containing four accounts
+// with different shapes and verifies scanSnapshot only reports the one that
+// matches the zero-nonce / empty-code / non-empty-storage condition. Storage
+// slot keys and address preimages are also asserted.
+func TestScanSnapshot(t *testing.T) {
+	db := rawdb.NewMemoryDatabase()
 
-		// Init code:
-		//   PUSH1 0x42 PUSH1 0x00 SSTORE      ; storage[0] = 0x42
-		//   PUSH1 0x00 PUSH1 0x00 RETURN      ; return 0 bytes (no code)
-		initCode = common.Hex2Bytes("604260005560006000F3")
-	)
+	matchAddr := common.HexToAddress("0x0a0b0c0d0e0f10111213141516171819aaaabbbb")
+	withCodeAddr := common.HexToAddress("0xdeadbeef00000000000000000000000000000001")
+	emptyAddr := common.HexToAddress("0xdeadbeef00000000000000000000000000000002")
+	nonZeroNonceAddr := common.HexToAddress("0xdeadbeef00000000000000000000000000000003")
 
-	_, blocks, _ := core.GenerateChainWithGenesis(gspec, ethash.NewFaker(), 5, func(i int, gen *core.BlockGen) {
-		if i == 0 {
-			tx, err := types.SignTx(
-				types.NewContractCreation(gen.TxNonce(addr), new(big.Int), 200_000, big.NewInt(1), initCode),
-				signer, key,
-			)
-			if err != nil {
-				t.Fatalf("sign tx: %v", err)
-			}
-			gen.AddTx(tx)
-		}
+	// Synthetic non-empty hashes for the matching account.
+	storageRoot := common.HexToHash("0x1111111111111111111111111111111111111111111111111111111111111111")
+	customCodeHash := common.HexToHash("0x2222222222222222222222222222222222222222222222222222222222222222")
+
+	matchHash := writeSnapshotAccount(t, db, matchAddr, 0, 100, types.EmptyCodeHash, storageRoot)
+	writeSnapshotAccount(t, db, withCodeAddr, 0, 0, customCodeHash, storageRoot)
+	writeSnapshotAccount(t, db, emptyAddr, 0, 0, types.EmptyCodeHash, types.EmptyRootHash)
+	writeSnapshotAccount(t, db, nonZeroNonceAddr, 1, 0, types.EmptyCodeHash, storageRoot)
+
+	// Two storage slots for the matching account, with one preimage available.
+	slotKeyKnown := common.HexToHash("0x0000000000000000000000000000000000000000000000000000000000000007")
+	slotKeyUnknown := common.HexToHash("0x00000000000000000000000000000000000000000000000000000000000000ff")
+	slotHashKnown := crypto.Keccak256Hash(slotKeyKnown.Bytes())
+	slotHashUnknown := crypto.Keccak256Hash(slotKeyUnknown.Bytes())
+	rawdb.WriteStorageSnapshot(db, matchHash, slotHashKnown, []byte{0x42})
+	rawdb.WriteStorageSnapshot(db, matchHash, slotHashUnknown, []byte{0x99})
+
+	// Preimages: address of the matching account and one slot key.
+	rawdb.WritePreimages(db, map[common.Hash][]byte{
+		matchHash:     matchAddr.Bytes(),
+		slotHashKnown: slotKeyKnown.Bytes(),
 	})
 
-	chain, collector := makeTestChain(t, gspec, blocks)
-	defer chain.Stop()
-
-	expectAddr := crypto.CreateAddress(addr, 0)
-	if _, ok := collector.creations[expectAddr]; !ok {
-		t.Fatalf("tracer did not record contract address %s", expectAddr.Hex())
-	}
-
-	header := chain.GetHeaderByNumber(boundary.Uint64())
-	if header == nil {
-		t.Fatalf("missing header at boundary block %d", boundary.Uint64())
-	}
-	statedb, err := chain.StateAt(header.Root)
-	if err != nil {
-		t.Fatalf("StateAt: %v", err)
-	}
-
-	// Sanity-check the contract really has the property we set up.
-	if got := statedb.GetNonce(expectAddr); got != 0 {
-		t.Fatalf("expected nonce 0, got %d", got)
-	}
-	if got := statedb.GetCodeHash(expectAddr); got != types.EmptyCodeHash {
-		t.Fatalf("expected empty code hash, got %s", got.Hex())
-	}
-	if got := statedb.GetStorageRoot(expectAddr); got == (common.Hash{}) || got == types.EmptyRootHash {
-		t.Fatalf("expected non-empty storage root, got %s", got.Hex())
-	}
-
 	var buf bytes.Buffer
-	matches, err := inspectCreations(statedb, chain.TrieDB(), header.Root, collector.drain(), make(map[common.Address]struct{}), &buf)
+	emitted := make(map[common.Address]struct{})
+	matches, err := scanSnapshot(db, &buf, emitted)
 	if err != nil {
-		t.Fatalf("inspectCreations: %v", err)
+		t.Fatalf("scanSnapshot: %v", err)
 	}
 	if matches != 1 {
 		t.Fatalf("expected 1 match, got %d (output: %s)", matches, buf.String())
 	}
 
-	var match zeroNonceMatch
-	if err := json.NewDecoder(&buf).Decode(&match); err != nil {
+	var got zeroNonceMatch
+	if err := json.NewDecoder(&buf).Decode(&got); err != nil {
 		t.Fatalf("decode output: %v", err)
 	}
-	if match.Address == nil {
-		t.Fatalf("address missing from output")
+	if got.Address == nil || *got.Address != matchAddr {
+		t.Fatalf("address mismatch: got %v want %s", got.Address, matchAddr.Hex())
 	}
-	if *match.Address != expectAddr {
-		t.Fatalf("address mismatch: got %s want %s", match.Address.Hex(), expectAddr.Hex())
+	if got.AddressHash != matchHash {
+		t.Fatalf("address hash mismatch: got %s want %s", got.AddressHash.Hex(), matchHash.Hex())
 	}
-	if match.AddressHash != crypto.Keccak256Hash(expectAddr.Bytes()) {
-		t.Fatalf("address hash mismatch: got %s", match.AddressHash.Hex())
+	if got.CodeHash != types.EmptyCodeHash {
+		t.Fatalf("code hash mismatch: got %s", got.CodeHash.Hex())
 	}
-	if match.CodeHash != types.EmptyCodeHash {
-		t.Fatalf("expected empty code hash in output, got %s", match.CodeHash.Hex())
+	if got.StorageRoot != storageRoot {
+		t.Fatalf("storage root mismatch: got %s want %s", got.StorageRoot.Hex(), storageRoot.Hex())
 	}
-	if match.StorageRoot == types.EmptyRootHash {
-		t.Fatalf("expected non-empty storage root in output")
-	}
-	if len(match.Storage) != 1 {
-		t.Fatalf("expected 1 storage entry, got %d (%+v)", len(match.Storage), match.Storage)
-	}
-	slot := match.Storage[0]
-	if slot.Key == nil || *slot.Key != (common.Hash{}) {
-		t.Fatalf("expected storage key preimage 0x000...0, got %v", slot.Key)
-	}
-	if want := crypto.Keccak256Hash(common.Hash{}.Bytes()); slot.KeyHash != want {
-		t.Fatalf("storage key hash mismatch: got %s want %s", slot.KeyHash.Hex(), want.Hex())
-	}
-}
 
-// TestZeroNonceFinderIgnoresAccountsWithCode confirms that contracts that
-// successfully deployed code (post-EIP-2-style) are NOT reported, even if
-// they exist with nonce 0.
-func TestZeroNonceFinderIgnoresAccountsWithCode(t *testing.T) {
-	var (
-		key, _   = crypto.GenerateKey()
-		addr     = crypto.PubkeyToAddress(key.PublicKey)
-		boundary = big.NewInt(5)
-		config   = testChainConfig(boundary)
-		gspec    = &core.Genesis{
-			Config: config,
-			Alloc:  types.GenesisAlloc{addr: {Balance: big.NewInt(1_000_000_000_000_000_000)}},
-		}
-		signer = types.LatestSigner(config)
-
-		// Init code: SSTORE then RETURN 1 byte of deployed code.
-		initCode = common.Hex2Bytes("60426000556001600060003960016000F3")
-	)
-
-	_, blocks, _ := core.GenerateChainWithGenesis(gspec, ethash.NewFaker(), 5, func(i int, gen *core.BlockGen) {
-		if i == 0 {
-			tx, err := types.SignTx(
-				types.NewContractCreation(gen.TxNonce(addr), new(big.Int), 200_000, big.NewInt(1), initCode),
-				signer, key,
-			)
-			if err != nil {
-				t.Fatalf("sign tx: %v", err)
+	if len(got.Storage) != 2 {
+		t.Fatalf("expected 2 storage slots, got %d (%+v)", len(got.Storage), got.Storage)
+	}
+	var foundKnown, foundUnknown bool
+	for _, slot := range got.Storage {
+		switch slot.KeyHash {
+		case slotHashKnown:
+			foundKnown = true
+			if slot.Key == nil || *slot.Key != slotKeyKnown {
+				t.Errorf("known slot preimage missing or wrong: %+v", slot)
 			}
-			gen.AddTx(tx)
+		case slotHashUnknown:
+			foundUnknown = true
+			if slot.Key != nil {
+				t.Errorf("expected no preimage for unknown slot, got %s", slot.Key.Hex())
+			}
+		default:
+			t.Errorf("unexpected slot in output: %+v", slot)
 		}
-	})
-
-	chain, collector := makeTestChain(t, gspec, blocks)
-	defer chain.Stop()
-
-	expectAddr := crypto.CreateAddress(addr, 0)
-	header := chain.GetHeaderByNumber(boundary.Uint64())
-	statedb, err := chain.StateAt(header.Root)
-	if err != nil {
-		t.Fatalf("StateAt: %v", err)
 	}
-	if got := statedb.GetCodeHash(expectAddr); got == types.EmptyCodeHash {
-		t.Fatalf("test setup: expected non-empty deployed code at %s", expectAddr.Hex())
+	if !foundKnown || !foundUnknown {
+		t.Fatalf("missing one of the expected slots; foundKnown=%v foundUnknown=%v", foundKnown, foundUnknown)
 	}
 
-	var buf bytes.Buffer
-	matches, err := inspectCreations(statedb, chain.TrieDB(), header.Root, collector.drain(), make(map[common.Address]struct{}), &buf)
+	// Re-scan should be a no-op (dedupe via emitted set).
+	buf.Reset()
+	matches, err = scanSnapshot(db, &buf, emitted)
 	if err != nil {
-		t.Fatalf("inspectCreations: %v", err)
+		t.Fatalf("rescan: %v", err)
 	}
 	if matches != 0 {
-		t.Fatalf("expected 0 matches (contract has code), got %d; output: %s", matches, buf.String())
+		t.Fatalf("expected 0 matches on rescan (already emitted), got %d (output: %s)", matches, buf.String())
 	}
 }
