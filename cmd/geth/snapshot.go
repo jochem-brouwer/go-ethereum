@@ -170,6 +170,50 @@ The export-preimages command exports hash preimages to a flat file, in exactly
 the expected order for the overlay tree migration.
 `,
 			},
+			{
+				Action:    findZeroNonceReplay,
+				Name:      "find-zero-nonce-replay",
+				Usage:     "Replay chain history to find pre-Spurious-Dragon zero-nonce accounts with non-empty storage",
+				ArgsUsage: "<era-dir>",
+				Flags: slices.Concat(
+					[]cli.Flag{utils.EraFormatFlag},
+					utils.NetworkFlags,
+					utils.DatabaseFlags,
+				),
+				Description: `
+geth snapshot find-zero-nonce-replay <era-dir>
+
+Replays the chain from genesis through the EIP-158 (Spurious Dragon) activation
+block using Era1 archives. Every contract created via a contract-creating
+transaction or the CREATE/CREATE2 opcodes is recorded by address; once the
+boundary block is committed the post-state of each tracked address is checked
+for the zero-nonce, empty-code, non-empty-storage condition that is only
+reachable for contracts deployed before EIP-161.
+
+Matching accounts are written as JSON Lines on stdout, with the address
+(preimage), the keccak256 of the address (the trie key), the balance, the
+code hash, and the storage root.
+
+Use 'geth download-era' to fetch the Era1 archives prior to running this
+command.
+`,
+			},
+			{
+				Action:    findZeroNonce,
+				Name:      "find-zero-nonce",
+				Usage:     "Iterate snapshot to find zero-nonce accounts with non-empty storage",
+				ArgsUsage: "[<root>]",
+				Flags:     slices.Concat(utils.NetworkFlags, utils.DatabaseFlags),
+				Description: `
+geth snapshot find-zero-nonce [<state-root>]
+
+Iterates the snapshot at the given state root (or the chain head if omitted)
+and emits every account whose stored value matches the zero-nonce, empty-code,
+non-empty-storage condition. Accounts are keyed by keccak256(address) on disk;
+the raw address is included in the output only when the geth preimage table
+contains it (e.g. when the node was run with --cache.preimages).
+`,
+			},
 		},
 	}
 )
