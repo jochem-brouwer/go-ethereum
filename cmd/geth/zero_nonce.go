@@ -27,6 +27,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/ethereum/go-ethereum/cmd/utils"
@@ -58,18 +59,30 @@ import (
 
 // createCollector accumulates the addresses of all contracts created by either
 // a contract-creating transaction or the CREATE/CREATE2 opcodes during chain
-// replay. Both routes go through evm.create, which fires OnEnter with the
-// CREATE/CREATE2 opcode in the typ byte, so a single hook captures everything.
+// replay, together with every storage slot they wrote. Both create routes go
+// through evm.create, which fires OnEnter with the CREATE/CREATE2 opcode in
+// the typ byte, so a single hook captures every contract address. Storage
+// writes are filtered to addresses already in the create-set; for accounts
+// that match the zero-nonce/empty-code/non-empty-storage condition the only
+// execution that ever runs is the init code (no code = no later writes), so
+// this captures the complete set of slot keys for matching contracts.
 type createCollector struct {
 	creations map[common.Address]struct{}
+	storage   map[common.Address]map[common.Hash]struct{}
 }
 
 func newCreateCollector() *createCollector {
-	return &createCollector{creations: make(map[common.Address]struct{})}
+	return &createCollector{
+		creations: make(map[common.Address]struct{}),
+		storage:   make(map[common.Address]map[common.Hash]struct{}),
+	}
 }
 
 func (c *createCollector) hooks() *tracing.Hooks {
-	return &tracing.Hooks{OnEnter: c.onEnter}
+	return &tracing.Hooks{
+		OnEnter:         c.onEnter,
+		OnStorageChange: c.onStorageChange,
+	}
 }
 
 func (c *createCollector) onEnter(depth int, typ byte, from, to common.Address, input []byte, gas uint64, value *big.Int) {
@@ -77,6 +90,27 @@ func (c *createCollector) onEnter(depth int, typ byte, from, to common.Address, 
 	case byte(vm.CREATE), byte(vm.CREATE2):
 		c.creations[to] = struct{}{}
 	}
+}
+
+func (c *createCollector) onStorageChange(addr common.Address, slot, prev, new common.Hash) {
+	if _, ok := c.creations[addr]; !ok {
+		return
+	}
+	keys, ok := c.storage[addr]
+	if !ok {
+		keys = make(map[common.Hash]struct{})
+		c.storage[addr] = keys
+	}
+	keys[slot] = struct{}{}
+}
+
+// zeroNonceSlot describes one storage slot of a matching account. KeyHash is
+// always set (it is the on-disk trie key); Key is the preimage and is only
+// populated when known: always for the replay scanner (we observe the slot
+// key before it is hashed) and opportunistically for the snapshot scanner.
+type zeroNonceSlot struct {
+	Key     *common.Hash `json:"key,omitempty"`
+	KeyHash common.Hash  `json:"keyHash"`
 }
 
 // zeroNonceMatch is one record in the JSON Lines output stream. Address is
@@ -89,16 +123,20 @@ type zeroNonceMatch struct {
 	Balance     *hexutil.Big    `json:"balance"`
 	CodeHash    common.Hash     `json:"codeHash"`
 	StorageRoot common.Hash     `json:"storageRoot"`
+	Storage     []zeroNonceSlot `json:"storage,omitempty"`
 }
 
 // inspectCreations walks the tracked create-set and emits any account whose
 // post-state has nonce==0, empty code, and non-empty storage. Accounts that
 // were SELFDESTRUCT-ed before the boundary will not exist in state and are
-// silently skipped — pre-EIP-6780 SELFDESTRUCT clears storage as well.
-func inspectCreations(statedb *state.StateDB, creations map[common.Address]struct{}, out io.Writer) (int, error) {
+// silently skipped — pre-EIP-6780 SELFDESTRUCT clears storage as well. The
+// recorded slot keys are filtered to those whose post-state value is non-zero
+// at the boundary, since slots that were written then cleared during the init
+// code do not appear in the on-disk storage trie.
+func inspectCreations(statedb *state.StateDB, collector *createCollector, out io.Writer) (int, error) {
 	enc := json.NewEncoder(out)
 	matches := 0
-	for addr := range creations {
+	for addr := range collector.creations {
 		if !statedb.Exist(addr) {
 			continue
 		}
@@ -114,13 +152,30 @@ func inspectCreations(statedb *state.StateDB, creations map[common.Address]struc
 			continue
 		}
 		addrCopy := addr
-		if err := enc.Encode(zeroNonceMatch{
+		match := zeroNonceMatch{
 			Address:     &addrCopy,
 			AddressHash: crypto.Keccak256Hash(addr.Bytes()),
 			Balance:     (*hexutil.Big)(statedb.GetBalance(addr).ToBig()),
 			CodeHash:    codeHash,
 			StorageRoot: storageRoot,
-		}); err != nil {
+		}
+		// Sort slot keys so the output is deterministic.
+		slots := make([]common.Hash, 0, len(collector.storage[addr]))
+		for slot := range collector.storage[addr] {
+			if statedb.GetState(addr, slot) == (common.Hash{}) {
+				continue
+			}
+			slots = append(slots, slot)
+		}
+		sort.Slice(slots, func(i, j int) bool { return bytes.Compare(slots[i][:], slots[j][:]) < 0 })
+		for _, slot := range slots {
+			slotCopy := slot
+			match.Storage = append(match.Storage, zeroNonceSlot{
+				Key:     &slotCopy,
+				KeyHash: crypto.Keccak256Hash(slot.Bytes()),
+			})
+		}
+		if err := enc.Encode(match); err != nil {
 			return matches, err
 		}
 		matches++
@@ -198,7 +253,7 @@ func findZeroNonceReplay(ctx *cli.Context) error {
 	if err != nil {
 		return fmt.Errorf("open state at block %d (root %x): %w", target, header.Root, err)
 	}
-	matches, err := inspectCreations(statedb, collector.creations, os.Stdout)
+	matches, err := inspectCreations(statedb, collector, os.Stdout)
 	if err != nil {
 		return err
 	}
@@ -475,6 +530,20 @@ func findZeroNonce(ctx *cli.Context) error {
 			addr := common.BytesToAddress(pre)
 			match.Address = &addr
 		}
+		stIt, err := stateIt.StorageIterator(root, accIt.Hash(), common.Hash{})
+		if err != nil {
+			return fmt.Errorf("open storage iterator for %s: %w", accIt.Hash().Hex(), err)
+		}
+		for stIt.Next() {
+			slotHash := stIt.Hash()
+			slot := zeroNonceSlot{KeyHash: slotHash}
+			if pre := rawdb.ReadPreimage(db, slotHash); len(pre) == common.HashLength {
+				key := common.BytesToHash(pre)
+				slot.Key = &key
+			}
+			match.Storage = append(match.Storage, slot)
+		}
+		stIt.Release()
 		if err := enc.Encode(match); err != nil {
 			return err
 		}

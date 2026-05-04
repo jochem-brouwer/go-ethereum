@@ -139,7 +139,7 @@ func TestZeroNonceFinder(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	matches, err := inspectCreations(statedb, collector.creations, &buf)
+	matches, err := inspectCreations(statedb, collector, &buf)
 	if err != nil {
 		t.Fatalf("inspectCreations: %v", err)
 	}
@@ -165,6 +165,18 @@ func TestZeroNonceFinder(t *testing.T) {
 	}
 	if match.StorageRoot == types.EmptyRootHash {
 		t.Fatalf("expected non-empty storage root in output")
+	}
+	// Init code wrote a single slot at key=0 (all-zero hash). The output
+	// must include that slot, with both preimage and hash populated.
+	if len(match.Storage) != 1 {
+		t.Fatalf("expected 1 storage entry, got %d (%+v)", len(match.Storage), match.Storage)
+	}
+	slot := match.Storage[0]
+	if slot.Key == nil || *slot.Key != (common.Hash{}) {
+		t.Fatalf("expected storage key preimage 0x000...0, got %v", slot.Key)
+	}
+	if want := crypto.Keccak256Hash(common.Hash{}.Bytes()); slot.KeyHash != want {
+		t.Fatalf("storage key hash mismatch: got %s want %s", slot.KeyHash.Hex(), want.Hex())
 	}
 }
 
@@ -249,7 +261,7 @@ func TestZeroNonceFinderIgnoresAccountsWithCode(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	matches, err := inspectCreations(statedb, collector.creations, &buf)
+	matches, err := inspectCreations(statedb, collector, &buf)
 	if err != nil {
 		t.Fatalf("inspectCreations: %v", err)
 	}
