@@ -190,6 +190,42 @@ files (e.g. fetched with the download-era command from a newer Geth release).
 `,
 			},
 			{
+				Action:    filterAccounts,
+				Name:      "filter-accounts",
+				Usage:     "Iterate snapshot and emit hashed addresses of accounts matching code/nonce/storage/balance filters",
+				ArgsUsage: "",
+				Flags: flags.Merge(
+					[]cli.Flag{
+						filterAccountsCodeFlag,
+						filterAccountsNonceFlag,
+						filterAccountsStorageFlag,
+						filterAccountsBalanceFlag,
+						filterAccountsOutFlag,
+					},
+					utils.NetworkFlags, utils.DatabaseFlags,
+				),
+				Description: `
+geth snapshot filter-accounts [--filter-accounts.code=any|empty|nonempty]
+                              [--filter-accounts.nonce=any|zero|nonzero]
+                              [--filter-accounts.storage=any|empty|nonempty]
+                              [--filter-accounts.balance=any|zero|nonzero]
+                              [--filter-accounts.out=-|<path>]
+
+Walks the disk-layer snapshot of the open datadir and emits one JSON-Lines
+record per account satisfying every supplied filter. Each predicate is
+independent and tri-state: 'any' (no constraint), the empty/zero side, or the
+nonempty/nonzero side.
+
+For each matching account the keccak256(address) trie key is emitted; the
+20-byte address preimage is also emitted when the trie database has it
+recorded (e.g. when the node was run with --cache.preimages, in archive mode,
+or via find-zero-nonce-replay).
+
+The DB's head block number is logged at start so callers know which state
+was filtered, and the total match count is logged at the end.
+`,
+			},
+			{
 				Action:    findZeroNonce,
 				Name:      "find-zero-nonce",
 				Usage:     "Iterate snapshot to find zero-nonce accounts with non-empty storage",
