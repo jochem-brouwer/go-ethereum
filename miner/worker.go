@@ -75,6 +75,11 @@ type environment struct {
 	blobs    int
 	bal      *bal.ConstructionBlockAccessList
 
+	// sidecarsOptional allows committing blob transactions without their
+	// sidecar data. Transactions supplied via testing_buildBlockV* arrive in
+	// canonical encoding, which does not carry the blobs.
+	sidecarsOptional bool
+
 	witness *stateless.Witness
 }
 
@@ -169,6 +174,7 @@ func (miner *Miner) generateWork(ctx context.Context, genParam *generateParams, 
 		// If forceOverrides is true and overrideTxs is not empty, commit the override transactions
 		// otherwise, fill the block with the current transactions from the txpool
 		if genParam.forceOverrides && len(genParam.overrideTxs) > 0 {
+			work.sidecarsOptional = true
 			for _, tx := range genParam.overrideTxs {
 				work.state.SetTxContext(tx.Hash(), work.tcount, uint32(work.tcount+1))
 				if err := miner.commitTransaction(ctx, work, tx); err != nil {
@@ -380,7 +386,7 @@ func (miner *Miner) commitTransaction(ctx context.Context, env *environment, tx 
 
 func (miner *Miner) commitBlobTransaction(env *environment, tx *types.Transaction) error {
 	sc := tx.BlobTxSidecar()
-	if sc == nil {
+	if sc == nil && !env.sidecarsOptional {
 		panic("blob transaction without blobs in miner")
 	}
 	// Checking against blob gas limit: It's kind of ugly to perform this check here, but there
@@ -388,19 +394,21 @@ func (miner *Miner) commitBlobTransaction(env *environment, tx *types.Transactio
 	// and not during execution. This means core.ApplyTransaction will not return an error if the
 	// tx has too many blobs. So we have to explicitly check it here.
 	maxBlobs := miner.maxBlobsPerBlock(env.header.Time)
-	if env.blobs+len(sc.Blobs) > maxBlobs {
+	if env.blobs+len(tx.BlobHashes()) > maxBlobs {
 		return errors.New("max data blobs reached")
 	}
 	receipt, bal, err := miner.applyTransaction(env, tx)
 	if err != nil {
 		return err
 	}
-	txNoBlob := tx.WithoutBlobTxSidecar()
-	env.txs = append(env.txs, txNoBlob)
+	if sc != nil {
+		tx = tx.WithoutBlobTxSidecar()
+		env.sidecars = append(env.sidecars, sc)
+	}
+	env.txs = append(env.txs, tx)
 	env.receipts = append(env.receipts, receipt)
-	env.sidecars = append(env.sidecars, sc)
-	env.blobs += len(sc.Blobs)
-	env.size += txNoBlob.Size()
+	env.blobs += len(tx.BlobHashes())
+	env.size += tx.Size()
 	*env.header.BlobGasUsed += receipt.BlobGasUsed
 	env.tcount++
 	env.bal.Merge(bal)

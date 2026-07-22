@@ -27,6 +27,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/holiman/uint256"
 )
 
 func TestBuildBlockV1(t *testing.T) {
@@ -118,6 +119,59 @@ func TestBuildBlockV1(t *testing.T) {
 			t.Errorf("expected 1 transaction, got %d", len(envelope.ExecutionPayload.Transactions))
 		}
 	})
+}
+
+// TestBuildBlockV1WithBlobTx checks that blob transactions supplied in canonical
+// encoding (i.e. without the blob sidecar) are accepted by testing_buildBlockV1.
+func TestBuildBlockV1WithBlobTx(t *testing.T) {
+	genesis, blocks := generateMergeChain(5, true)
+
+	// Activate Shanghai and Cancun on the next block.
+	time := blocks[len(blocks)-1].Time() + 5
+	genesis.Config.ShanghaiTime = &time
+	genesis.Config.CancunTime = &time
+	genesis.Config.BlobScheduleConfig = params.DefaultBlobSchedule
+
+	n, ethservice := startEthService(t, genesis, blocks)
+	defer n.Close()
+
+	parent := ethservice.BlockChain().CurrentBlock()
+	attrs := engine.PayloadAttributes{
+		Timestamp:             parent.Time + 5,
+		Random:                crypto.Keccak256Hash([]byte("test")),
+		SuggestedFeeRecipient: parent.Coinbase,
+		Withdrawals:           make([]*types.Withdrawal, 0),
+		BeaconRoot:            &common.Hash{42},
+	}
+
+	nonce, _ := ethservice.APIBackend.GetPoolNonce(context.Background(), testAddr)
+	tx := types.MustSignNewTx(testKey, types.LatestSigner(ethservice.BlockChain().Config()), &types.BlobTx{
+		ChainID:    uint256.MustFromBig(ethservice.BlockChain().Config().ChainID),
+		Nonce:      nonce,
+		GasTipCap:  uint256.NewInt(params.GWei),
+		GasFeeCap:  uint256.NewInt(params.InitialBaseFee * 2),
+		Gas:        params.TxGas,
+		To:         testAddr,
+		BlobFeeCap: uint256.NewInt(params.GWei),
+		BlobHashes: []common.Hash{{0x01}},
+	})
+	enc, _ := tx.MarshalBinary()
+	txs := []hexutil.Bytes{enc}
+
+	api := &testingAPI{eth: ethservice}
+	envelope, err := api.BuildBlockV1(parent.Hash(), attrs, &txs, nil)
+	if err != nil {
+		t.Fatalf("BuildBlockV1 with blob transaction failed: %v", err)
+	}
+	if len(envelope.ExecutionPayload.Transactions) != 1 {
+		t.Fatalf("expected 1 transaction, got %d", len(envelope.ExecutionPayload.Transactions))
+	}
+	if used := envelope.ExecutionPayload.BlobGasUsed; used == nil || *used != params.BlobTxBlobGasPerBlob {
+		t.Errorf("blob gas used mismatch: got %v want %d", used, params.BlobTxBlobGasPerBlob)
+	}
+	if got := len(envelope.BlobsBundle.Blobs); got != 0 {
+		t.Errorf("expected empty blobs bundle, got %d blobs", got)
+	}
 }
 
 func TestCommitBlockV1(t *testing.T) {
