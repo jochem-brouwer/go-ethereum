@@ -521,6 +521,75 @@ func TestForkchoiceUpdatedReorgDepthLimit(t *testing.T) {
 	})
 }
 
+// TestForkchoiceUpdatedToFinalizedBlock checks that a forkchoice update whose
+// head is the finalized block actually moves the chain head there.
+//
+// The finalized block is the one block every client must be able to build on:
+// when the chain finalizes F and the next proposer produces B on top of F,
+// following the canonical chain means executing B against F's post-state. A
+// forkchoice update naming F as the head is therefore a legitimate request,
+// and the only legitimate answer is to make F the head.
+//
+// forkchoiceUpdated instead returns early for any head at or below the
+// finalized block, answering VALID with the requested hash as LatestValidHash
+// while leaving the head untouched. The caller is told its fork choice was
+// applied when it was not, and has no way to tell the difference from the
+// response alone.
+//
+// This matters beyond the bookkeeping. The early return sits in front of
+// SetCanonical, which is what re-executes ancestors to rebuild a state the
+// node no longer holds. A node whose head has drifted past its state
+// retention window can still recover F by being asked to set its head to
+// it — unless F is the finalized block, in which case the request is
+// dropped, and newPayload for a child of F keeps answering ACCEPTED because
+// it never attempts recovery either.
+func TestForkchoiceUpdatedToFinalizedBlock(t *testing.T) {
+	genesis, blocks := generateMergeChain(10, true)
+
+	n, ethservice := startEthService(t, genesis, blocks)
+	defer n.Close()
+
+	api := newConsensusAPIWithoutHeartbeat(ethservice)
+
+	// Finalize block 5 with the head out at block 10.
+	finalized := blocks[4]
+	update := engine.ForkchoiceStateV1{
+		HeadBlockHash:      blocks[9].Hash(),
+		SafeBlockHash:      finalized.Hash(),
+		FinalizedBlockHash: finalized.Hash(),
+	}
+	if _, err := api.ForkchoiceUpdatedV1(context.Background(), update, nil); err != nil {
+		t.Fatalf("failed to finalize block %d: %v", finalized.NumberU64(), err)
+	}
+	if got := ethservice.BlockChain().CurrentFinalBlock().Number.Uint64(); got != finalized.NumberU64() {
+		t.Fatalf("finalized block not set: have %d, want %d", got, finalized.NumberU64())
+	}
+
+	// Ask for the head to be moved back onto the finalized block, as a caller
+	// would before building an alternative branch from it.
+	back := engine.ForkchoiceStateV1{
+		HeadBlockHash:      finalized.Hash(),
+		SafeBlockHash:      finalized.Hash(),
+		FinalizedBlockHash: finalized.Hash(),
+	}
+	resp, err := api.ForkchoiceUpdatedV1(context.Background(), back, nil)
+	if err != nil {
+		t.Fatalf("forkchoice to the finalized block failed: %v", err)
+	}
+	if resp.PayloadStatus.Status != engine.VALID {
+		t.Fatalf("forkchoice to the finalized block: have status %s, want %s",
+			resp.PayloadStatus.Status, engine.VALID)
+	}
+
+	// The response said VALID, so the head must be where it was asked to be.
+	if head := ethservice.BlockChain().CurrentBlock().Hash(); head != finalized.Hash() {
+		t.Fatalf("chain head not moved to the finalized block: have %d (%x), want %d (%x) — "+
+			"forkchoiceUpdated reported VALID without applying the update",
+			ethservice.BlockChain().CurrentBlock().Number.Uint64(), head[:8],
+			finalized.NumberU64(), finalized.Hash().Bytes()[:8])
+	}
+}
+
 func TestFullAPI(t *testing.T) {
 	genesis, preMergeBlocks := generateMergeChain(10, false)
 	n, ethservice := startEthService(t, genesis, preMergeBlocks)
